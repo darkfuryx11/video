@@ -75,18 +75,59 @@ def save_config(data: dict) -> None:
 _cfg = load_config()
 
 # ── Constants ───────────────────────────────────────────────────────
-VERSION = "2.0.0"
-DEFAULT_MODEL = "claude-haiku-4-5-20251001"
-CLAUDE_MODELS = [
-    "claude-haiku-4-5-20251001",
-    "claude-sonnet-4-6",
-    "claude-opus-4-6",
-]
+VERSION = "3.0.0"
 DEFAULT_FRAME_COUNT = 16
 DEFAULT_MAX_SIZE = 1280
 DEFAULT_MAX_TOKENS = 1024
 DEFAULT_MAX_TOKENS_LIMIT = 4096
 MAX_HISTORY = 5
+
+# Provider → list of (display_name, model_id)
+PROVIDER_MODELS = {
+    "Claude": [
+        ("claude-haiku-4-5 👁️ (fastest)", "claude-haiku-4-5-20251001"),
+        ("claude-sonnet-4-6 👁️ (balanced)", "claude-sonnet-4-6"),
+        ("claude-opus-4-6 👁️ (best)", "claude-opus-4-6"),
+    ],
+    "OpenAI": [
+        ("gpt-4o-mini 👁️ (fastest)", "gpt-4o-mini"),
+        ("gpt-4o 👁️ (best)", "gpt-4o"),
+        ("gpt-4.1-mini 👁️", "gpt-4.1-mini"),
+    ],
+    "Gemini": [
+        ("gemini-2.0-flash 👁️ (fast)", "gemini-2.0-flash"),
+        ("gemini-1.5-flash 👁️", "gemini-1.5-flash"),
+        ("gemini-1.5-pro 👁️ (best)", "gemini-1.5-pro"),
+    ],
+    "Qwen": [
+        ("qwen-vl-max 👁️ (best)", "qwen-vl-max"),
+        ("qwen-vl-plus 👁️ (fast)", "qwen-vl-plus"),
+    ],
+}
+
+def detect_provider(key: str) -> str:
+    """Detect API provider from key prefix."""
+    key = (key or "").strip()
+    if not key:
+        return ""
+    if key.startswith("sk-ant"):
+        return "Claude"
+    if key.startswith("AIza") or key.startswith("ya29."):
+        return "Gemini"
+    if key.startswith("sk-"):
+        return "OpenAI"
+    return ""
+
+def get_provider_models(provider: str) -> list[str]:
+    """Return display names for a provider."""
+    return [d for d, _ in PROVIDER_MODELS.get(provider, [])]
+
+def resolve_model_id(provider: str, display: str) -> str:
+    """Resolve display name → actual model_id."""
+    for d, mid in PROVIDER_MODELS.get(provider, []):
+        if d == display:
+            return mid
+    return display  # fallback: use as-is
 
 PROMPT_MODES = {
     "🎨 Describe (image generation prompt)": {
@@ -438,6 +479,7 @@ def process_video(
     video_file,
     api_url: str,
     api_key: str,
+    provider: str,
     model_name: str,
     mode: str,
     custom_prompt: str,
@@ -465,8 +507,7 @@ def process_video(
     frames_temp_dir = None
 
     # Resolve display name → actual model_id
-    model_map = {d: m for d, m in fetch_models()}
-    model_name = model_map.get(model_name, model_name)
+    model_id = resolve_model_id(provider, model_name)
 
     # ── Step 1: Video Info ──
     progress(0.05, desc="🔍 Reading video metadata...")
@@ -550,61 +591,39 @@ def process_video(
         f"🖼️ **Frames:** {len(frames)}"
     ), "", "", "", frames_temp_dir
 
-    # ── Step 5: Call Claude API ──
-    progress(0.40, desc="🚀 Calling Claude vision API...")
+    # ── Step 5: Call Vision API ──
     if not api_key or not api_key.strip():
-        yield strip, "❌ กรุณาใส่ Anthropic API Key", "", "", "", frames_temp_dir
+        yield strip, "❌ กรุณาใส่ API Key", "", "", "", frames_temp_dir
+        return
+    if not provider:
+        yield strip, "❌ ไม่รู้จัก API Key format — ลองใส่ key ใหม่", "", "", "", frames_temp_dir
         return
 
-    # Build Anthropic content: images first, then text
-    content = []
-    for i, frame in enumerate(frames):
+    progress(0.40, desc=f"🚀 Calling {provider} vision API...")
+    for i in range(len(frames)):
         progress(0.40 + 0.40 * (i / len(frames)), desc=f"🖼️ Encoding frame {i+1}/{len(frames)}...")
-        b64 = frame_to_base64(frame, quality)
-        content.append({
-            "type": "image",
-            "source": {"type": "base64", "media_type": "image/jpeg", "data": b64},
-        })
-    content.append({"type": "text", "text": prompt})
 
     api_start = time.time()
     try:
-        client = anthropic.Anthropic(api_key=api_key.strip())
-        response = client.messages.create(
-            model=model_name,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            system=(
-                "You are a helpful vision-language assistant. "
-                "Answer directly with the final answer only. No reasoning or preamble."
-            ),
-            messages=[{"role": "user", "content": content}],
+        raw_output, prompt_tokens, completion_tokens = call_provider_api(
+            frames, prompt, provider, api_key, model_id, max_tokens, temperature
         )
-    except anthropic.AuthenticationError:
-        yield strip, "❌ API Key ไม่ถูกต้อง กรุณาตรวจสอบ Anthropic API Key", "", "", "", frames_temp_dir
-        return
-    except anthropic.RateLimitError:
-        yield strip, "❌ Rate limit exceeded กรุณารอสักครู่แล้วลองใหม่", "", "", "", frames_temp_dir
-        return
     except Exception as e:
-        yield strip, f"❌ Claude API error: {e}", "", "", "", frames_temp_dir
+        yield strip, f"❌ {provider} API error: {e}", "", "", "", frames_temp_dir
         return
 
     api_elapsed = time.time() - api_start
-    prompt_tokens = response.usage.input_tokens
-    completion_tokens = response.usage.output_tokens
 
     # ── Step 6: Extract output ──
     progress(0.90, desc="✅ Done")
-    raw_output = response.content[0].text
     cleaned = clean_output(raw_output)
 
     # ── Step 7: Build Stats ──
     total_elapsed = time.time() - start_time
     stats = (
         f"{info_text}\n\n{frame_info}"
-        f"\n\n⚡ **API:** {api_elapsed:.1f}s | 🎯 **Tokens:** {prompt_tokens}/{completion_tokens}"
-        f" | ⏱ **Total:** {total_elapsed:.1f}s"
+        f"\n\n⚡ **{provider}** {api_elapsed:.1f}s | 🎯 **Tokens:** {prompt_tokens}/{completion_tokens}"
+        f" | ⏱ **Total:** {total_elapsed:.1f}s | 🤖 `{model_id}`"
         f"\n🎯 **Mode:** {display_mode}"
     )
 
@@ -616,14 +635,75 @@ def process_video(
     yield strip, stats, cleaned, cleaned, default_filename, frames_temp_dir
 
 
-# ── Model List ──────────────────────────────────────────────────────
+# ── Unified Vision API Call ──────────────────────────────────────────
+def call_provider_api(
+    frames: list,
+    prompt: str,
+    provider: str,
+    api_key: str,
+    model_id: str,
+    max_tokens: int = 1024,
+    temperature: float = 0.6,
+) -> tuple[str, int, int]:
+    """Call the appropriate vision API. Returns (text, input_tokens, output_tokens)."""
+    key = api_key.strip()
+    system_msg = (
+        "You are a helpful vision-language assistant. "
+        "Answer directly with the final answer only. No reasoning or preamble."
+    )
+
+    if provider == "Claude":
+        client = anthropic.Anthropic(api_key=key)
+        content = []
+        for frame in frames:
+            b64 = frame_to_base64(frame)
+            content.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}})
+        content.append({"type": "text", "text": prompt})
+        resp = client.messages.create(
+            model=model_id, max_tokens=max_tokens, temperature=temperature,
+            system=system_msg, messages=[{"role": "user", "content": content}],
+        )
+        return resp.content[0].text, resp.usage.input_tokens, resp.usage.output_tokens
+
+    elif provider in ("OpenAI", "Qwen"):
+        from openai import OpenAI as _OpenAI
+        base_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1" if provider == "Qwen" else None
+        client = _OpenAI(api_key=key, base_url=base_url)
+        content = []
+        for frame in frames:
+            b64 = frame_to_base64(frame)
+            content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
+        content.append({"type": "text", "text": prompt})
+        resp = client.chat.completions.create(
+            model=model_id, max_tokens=max_tokens, temperature=temperature,
+            messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": content}],
+        )
+        u = resp.usage
+        return resp.choices[0].message.content, u.prompt_tokens, u.completion_tokens
+
+    elif provider == "Gemini":
+        import google.generativeai as genai
+        genai.configure(api_key=key)
+        model = genai.GenerativeModel(model_name=model_id, system_instruction=system_msg)
+        parts = []
+        for frame in frames:
+            buf = io.BytesIO()
+            frame.convert("RGB").save(buf, format="JPEG", quality=80)
+            parts.append({"mime_type": "image/jpeg", "data": buf.getvalue()})
+        parts.append(prompt)
+        resp = model.generate_content(
+            parts,
+            generation_config={"max_output_tokens": max_tokens, "temperature": temperature},
+        )
+        return resp.text, 0, 0
+
+    else:
+        raise ValueError(f"Unknown provider: {provider}")
+
+
+# ── Model List (legacy compat) ───────────────────────────────────────
 def fetch_models(api_url: str = "", api_key: str = "") -> list[tuple[str, str]]:
-    """Return available Claude vision models."""
-    return [
-        ("claude-haiku-4-5 👁️ (fastest, cheapest)", "claude-haiku-4-5-20251001"),
-        ("claude-sonnet-4-6 👁️ (balanced)", "claude-sonnet-4-6"),
-        ("claude-opus-4-6 👁️ (most capable)", "claude-opus-4-6"),
-    ]
+    return PROVIDER_MODELS.get("Claude", [])
 
 
 # ── Gradio Theme (Gradio 6.0: pass to launch(), not Blocks) ──────
@@ -663,7 +743,7 @@ def build_ui():
         <div style="text-align: center; margin-bottom: 1rem;">
             <h1 class="title-gradient" style="font-size: 2.5rem; margin: 0;">🎬 Video → Prompt</h1>
             <p style="color: #888; font-size: 1rem; margin: 0;">
-                Extract AI prompts from video using Claude Vision API (Anthropic)
+                Claude · OpenAI · Gemini · Qwen — ใส่ key เดียว ระบบ detect เอง
             </p>
         </div>
         """)
@@ -679,35 +759,36 @@ def build_ui():
                 )
 
                 # ── API Settings ──
-                gr.Markdown("### ⚙️ Claude API Settings")
+                gr.Markdown("### ⚙️ API Settings")
+                _saved_key = _cfg.get("api_key") or os.environ.get("ANTHROPIC_API_KEY", "")
+                _init_provider = detect_provider(_saved_key)
+                _init_models = get_provider_models(_init_provider) if _init_provider else []
+
                 with gr.Row():
                     api_key = gr.Textbox(
-                        label="Anthropic API Key",
-                        value=_cfg.get("api_key") or os.environ.get("ANTHROPIC_API_KEY", ""),
-                        placeholder="sk-ant-api...",
+                        label="API Key (ใส่ key เดียว ระบบ detect เองว่าเป็นของใคร)",
+                        value=_saved_key,
+                        placeholder="sk-ant-...  /  sk-...  /  AIza...",
                         type="password",
-                        info="ใส่ API Key จาก console.anthropic.com",
                         scale=4,
                     )
-                    save_key_btn = gr.Button("💾 Save Key", variant="secondary", scale=1, size="sm")
+                    save_key_btn = gr.Button("💾 Save", variant="secondary", scale=1, size="sm")
+
+                provider_badge = gr.Markdown(
+                    f"✅ Detected: **{_init_provider}**" if _init_provider else "⚠️ ใส่ API Key เพื่อ detect provider"
+                )
+                provider_state = gr.State(_init_provider)
                 save_key_status = gr.Markdown("")
                 api_url = gr.Textbox(visible=False, value="")  # kept for compat
 
-                with gr.Row():
-                    model_name = gr.Dropdown(
-                        label="Model",
-                        choices=[d for d, _ in fetch_models()],
-                        value="claude-haiku-4-5 👁️ (fastest, cheapest)",
-                        allow_custom_value=True,
-                        interactive=True,
-                        scale=4,
-                    )
-                    refresh_btn = gr.Button(
-                        "🔄 Refresh",
-                        variant="secondary",
-                        scale=1,
-                        size="sm",
-                    )
+                model_name = gr.Dropdown(
+                    label="Model",
+                    choices=_init_models,
+                    value=_init_models[0] if _init_models else "",
+                    allow_custom_value=True,
+                    interactive=True,
+                )
+                refresh_btn = gr.Button(visible=False)  # kept for compat
                 model_status = gr.Markdown("")
 
                 # ── Mode ──
@@ -846,11 +927,27 @@ def build_ui():
         temp_balanced.click(fn=set_temp_balanced, outputs=[temperature])
         temp_precise.click(fn=set_temp_precise, outputs=[temperature])
 
+        def on_key_change(key_val):
+            """Auto-detect provider and update model list when key changes."""
+            p = detect_provider(key_val)
+            if p:
+                models = get_provider_models(p)
+                badge = f"✅ Detected: **{p}**"
+                return p, badge, gr.update(choices=models, value=models[0] if models else "")
+            return "", "⚠️ ไม่รู้จัก format — รองรับ: Claude (sk-ant-), OpenAI (sk-), Gemini (AIza)", gr.update(choices=[], value="")
+
+        api_key.change(
+            fn=on_key_change,
+            inputs=[api_key],
+            outputs=[provider_state, provider_badge, model_name],
+        )
+
         def on_save_key(key_val):
             if not key_val or not key_val.strip():
                 return "❌ กรุณาใส่ API Key ก่อน"
             save_config({"api_key": key_val.strip()})
-            return "✅ บันทึก API Key แล้ว (เปิดเว็บใหม่ key ยังคงอยู่)"
+            p = detect_provider(key_val)
+            return f"✅ บันทึกแล้ว ({p or 'Unknown'}) — เปิดเว็บใหม่ key ยังคงอยู่"
 
         save_key_btn.click(fn=on_save_key, inputs=[api_key], outputs=[save_key_status])
 
@@ -993,7 +1090,7 @@ def build_ui():
         process_event = process_btn.click(
             fn=process_video,
             inputs=[
-                video_input, api_url, api_key, model_name, mode, custom_prompt,
+                video_input, api_url, api_key, provider_state, model_name, mode, custom_prompt,
                 frame_count, max_size, max_tokens, temperature, quality,
             ],
             outputs=[
