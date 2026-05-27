@@ -21,13 +21,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+import anthropic
 import numpy as np
-import requests
 from PIL import Image
 
 # ── Config ──────────────────────────────────────────────────────────
-API_URL = "http://localhost:8080/v1/chat/completions"
-MODEL_NAME = "llmfan46_Qwen3.6-35B-A3B-uncensored-heretic-Q6_K.gguf"
+MODEL_NAME = "claude-haiku-4-5-20251001"
 DEFAULT_FRAME_COUNT = 16
 MAX_TOKENS = 1024
 
@@ -251,13 +250,6 @@ def frame_to_base64(img: Image.Image, quality: int = 85) -> str:
     return base64.b64encode(buf.getvalue()).decode()
 
 
-def estimate_tokens(frames: list[Image.Image]) -> int:
-    """Rough estimate: each 1280px frame ≈ 500-800 vision tokens for Qwen-VL."""
-    total_pixels = sum(f.width * f.height for f in frames)
-    # Qwen-VL uses ~0.5-0.8 tokens per 1000 pixels after patch embedding
-    return int(total_pixels * 0.6 / 1000)
-
-
 def call_vision_api(
     frames: list[Image.Image],
     prompt: str,
@@ -265,55 +257,51 @@ def call_vision_api(
     max_tokens: int = MAX_TOKENS,
     temperature: float = 0.6,
     verbose: bool = True,
-) -> dict:
+    api_key: str = "",
+) -> str:
     """
-    Send frames + prompt to llama.cpp vision API.
-    Returns full response dict.
+    Send frames + prompt to Anthropic Claude vision API.
+    Returns the generated text.
     """
-    # Build content array
-    content = [{"type": "text", "text": prompt}]
+    key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
+    if not key:
+        raise ValueError("ANTHROPIC_API_KEY not set. Pass api_key= or set env var.")
+
+    client = anthropic.Anthropic(api_key=key)
+
+    # Build content: images first, then the text prompt
+    content = []
     for frame in frames:
         b64 = frame_to_base64(frame)
         content.append({
-            "type": "image_url",
-            "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/jpeg", "data": b64},
         })
-
-    payload = {
-        "model": model,
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You are a helpful vision-language assistant. "
-                    "Answer directly with the final answer only. No <think> and no reasoning."
-                ),
-            },
-            {"role": "user", "content": content},
-        ],
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-        "top_p": 0.9,
-        "stop": ["<|im_end|>", "<|im_start|>"],
-    }
+    content.append({"type": "text", "text": prompt})
 
     if verbose:
-        est_tok = estimate_tokens(frames)
-        print(f"  📤 Sending {len(frames)} frames (~{est_tok} vision tokens) + prompt...")
+        print(f"  📤 Sending {len(frames)} frames to Claude ({model})...")
 
     t0 = time.perf_counter()
-    resp = requests.post(API_URL, json=payload, timeout=300)
-    resp.raise_for_status()
+    response = client.messages.create(
+        model=model,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        system=(
+            "You are a helpful vision-language assistant. "
+            "Answer directly with the final answer only. No reasoning or preamble."
+        ),
+        messages=[{"role": "user", "content": content}],
+    )
     elapsed = time.perf_counter() - t0
 
-    data = resp.json()
     if verbose:
-        usage = data.get("usage", {})
+        usage = response.usage
         print(f"  ✅ Response in {elapsed:.1f}s | "
-              f"prompt_tokens={usage.get('prompt_tokens','?')} "
-              f"completion_tokens={usage.get('completion_tokens','?')}")
+              f"input_tokens={usage.input_tokens} "
+              f"output_tokens={usage.output_tokens}")
 
-    return data
+    return response.content[0].text
 
 
 # ── Main Pipeline ───────────────────────────────────────────────────
@@ -365,54 +353,7 @@ def video_to_prompt(
         prompt = template.format(n=len(frames))
 
     # 4. Call API
-    response = call_vision_api(frames, prompt, model=model, verbose=verbose)
-
-    # 5. Extract text
-    message = response.get("choices", [{}])[0].get("message", {})
-    content = message.get("content", "")
-
-    # If content is empty, check reasoning_content (thinking models)
-    if not content.strip():
-        content = message.get("reasoning_content", "")
-
-    # Clean up thinking model output:
-    # Some models output reasoning inline, ending with a blank line then final answer.
-    # Try to extract just the final answer.
-    lines = content.strip().split("\n")
-    
-    # Pattern 1: Model wraps final answer after "---" or double newline + summary
-    # Look for the last substantial paragraph that doesn't look like reasoning
-    reasoning_markers = [
-        "The user wants", "Let me", "I need to", "First,", "Step 1",
-        "Analyze the", "Looking at", "The prompt asks", "I'll", "I should",
-        "Wait,", "Hmm,", "I see", "This is a", "Okay,", "Let's",
-        "The image", "Frame 1", "Frame 2", "Self-Correction",
-        "Draft", "Review against", "Final check", "Final Polish",
-        "Refining", "Synthesize", "So the",
-    ]
-    
-    # Find the last line that doesn't look like reasoning
-    cleaned_lines = []
-    in_reasoning = True
-    for line in reversed(lines):
-        stripped = line.strip()
-        if not stripped:
-            cleaned_lines.insert(0, line)
-            continue
-        is_reasoning = any(stripped.startswith(m) for m in reasoning_markers)
-        if not is_reasoning and in_reasoning:
-            in_reasoning = False
-        if not in_reasoning:
-            cleaned_lines.insert(0, line)
-    
-    if cleaned_lines:
-        content = "\n".join(cleaned_lines).strip()
-    
-    # Pattern 2: <｜end▁of▁thinking｜> marker (Qwen thinking format)
-    if " response" in content:
-        content = content.split(" response")[-1].strip()
-
-    return content.strip()
+    return call_vision_api(frames, prompt, model=model, verbose=verbose)
 
 
 # ── CLI ─────────────────────────────────────────────────────────────

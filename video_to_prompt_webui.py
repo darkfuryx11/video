@@ -34,19 +34,23 @@ from pathlib import Path
 from typing import Optional
 from datetime import datetime
 
+import anthropic
 import gradio as gr
 import numpy as np
-import requests
 from PIL import Image
 
 # ── Constants ───────────────────────────────────────────────────────
-VERSION = "1.1.0"
-DEFAULT_API_URL = "http://localhost:8080/v1/chat/completions"
-DEFAULT_MODEL = "llmfan46_Qwen3.6-35B-A3B-uncensored-heretic-Q6_K.gguf"
+VERSION = "2.0.0"
+DEFAULT_MODEL = "claude-haiku-4-5-20251001"
+CLAUDE_MODELS = [
+    "claude-haiku-4-5-20251001",
+    "claude-sonnet-4-6",
+    "claude-opus-4-6",
+]
 DEFAULT_FRAME_COUNT = 16
 DEFAULT_MAX_SIZE = 1280
 DEFAULT_MAX_TOKENS = 1024
-DEFAULT_MAX_TOKENS_LIMIT = 8192  # Max slider value for llama.cpp
+DEFAULT_MAX_TOKENS_LIMIT = 4096
 MAX_HISTORY = 5
 
 PROMPT_MODES = {
@@ -417,6 +421,10 @@ def process_video(
     start_time = time.time()
     frames_temp_dir = None
 
+    # Resolve display name → actual model_id
+    model_map = {d: m for d, m in fetch_models()}
+    model_name = model_map.get(model_name, model_name)
+
     # ── Step 1: Video Info ──
     progress(0.05, desc="🔍 Reading video metadata...")
     info = get_video_info(video_path)
@@ -497,68 +505,53 @@ def process_video(
         f"🖼️ **Frames:** {len(frames)}"
     ), "", "", "", frames_temp_dir
 
-    # ── Step 5: Call API ──
-    progress(0.40, desc="🚀 Calling vision API...")
-    content = [{"type": "text", "text": prompt}]
+    # ── Step 5: Call Claude API ──
+    progress(0.40, desc="🚀 Calling Claude vision API...")
+    if not api_key or not api_key.strip():
+        yield strip, "❌ กรุณาใส่ Anthropic API Key", "", "", "", frames_temp_dir
+        return
+
+    # Build Anthropic content: images first, then text
+    content = []
     for i, frame in enumerate(frames):
-        progress(0.40 + 0.01 * (i / len(frames)), desc=f"🖼️ Encoding frame {i+1}/{len(frames)}...")
+        progress(0.40 + 0.40 * (i / len(frames)), desc=f"🖼️ Encoding frame {i+1}/{len(frames)}...")
         b64 = frame_to_base64(frame, quality)
         content.append({
-            "type": "image_url",
-            "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/jpeg", "data": b64},
         })
-
-    payload = {
-        "model": model_name,
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You are a helpful vision-language assistant. "
-                    "Answer directly with the final answer only. No <think> and no reasoning."
-                ),
-            },
-            {"role": "user", "content": content},
-        ],
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-        "top_p": 0.9,
-        "stop": ["<|im_end|>", "<|im_start|>"],
-    }
+    content.append({"type": "text", "text": prompt})
 
     api_start = time.time()
     try:
-        headers = {}
-        if api_key and api_key.strip():
-            headers["Authorization"] = f"Bearer {api_key.strip()}"
-        
-        # Normalize URL: ensure it has /v1/chat/completions
-        url = api_url.rstrip("/")
-        if not url.endswith("/v1/chat/completions"):
-            url = url + "/v1/chat/completions"
-        
-        resp = requests.post(url, json=payload, headers=headers, timeout=300)
-        resp.raise_for_status()
-        data = resp.json()
-    except requests.exceptions.ConnectionError:
-        yield strip, f"❌ Cannot connect to API: `{api_url}`\n\nIs the server running?", "", "", "", frames_temp_dir
+        client = anthropic.Anthropic(api_key=api_key.strip())
+        response = client.messages.create(
+            model=model_name,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            system=(
+                "You are a helpful vision-language assistant. "
+                "Answer directly with the final answer only. No reasoning or preamble."
+            ),
+            messages=[{"role": "user", "content": content}],
+        )
+    except anthropic.AuthenticationError:
+        yield strip, "❌ API Key ไม่ถูกต้อง กรุณาตรวจสอบ Anthropic API Key", "", "", "", frames_temp_dir
         return
-    except requests.exceptions.Timeout:
-        yield strip, "❌ API request timed out (300s). Try fewer frames or smaller max_size.", "", "", "", frames_temp_dir
+    except anthropic.RateLimitError:
+        yield strip, "❌ Rate limit exceeded กรุณารอสักครู่แล้วลองใหม่", "", "", "", frames_temp_dir
         return
     except Exception as e:
-        yield strip, f"❌ API error: {e}", "", "", "", frames_temp_dir
+        yield strip, f"❌ Claude API error: {e}", "", "", "", frames_temp_dir
         return
 
     api_elapsed = time.time() - api_start
-    usage = data.get("usage", {})
-    prompt_tokens = usage.get("prompt_tokens", "?")
-    completion_tokens = usage.get("completion_tokens", "?")
+    prompt_tokens = response.usage.input_tokens
+    completion_tokens = response.usage.output_tokens
 
-    # ── Step 6: Extract & Clean ──
-    progress(0.90, desc="🧹 Cleaning output...")
-    message = data.get("choices", [{}])[0].get("message", {})
-    raw_output = message.get("content", "") or message.get("reasoning_content", "")
+    # ── Step 6: Extract output ──
+    progress(0.90, desc="✅ Done")
+    raw_output = response.content[0].text
     cleaned = clean_output(raw_output)
 
     # ── Step 7: Build Stats ──
@@ -578,73 +571,14 @@ def process_video(
     yield strip, stats, cleaned, cleaned, default_filename, frames_temp_dir
 
 
-# ── Model Fetch ─────────────────────────────────────────────────────
-def fetch_models(api_url: str, api_key: str = "") -> list[tuple[str, str]]:
-    """Fetch available models from llama.cpp API. Returns list of (display_name, model_id)."""
-    if not api_url or not api_url.strip():
-        return [("⚠️ Enter API URL first", "")]
-    
-    base_url = api_url.strip().rstrip("/")
-    for suffix in ["/v1/chat/completions", "/v1", "/chat/completions"]:
-        if base_url.endswith(suffix):
-            base_url = base_url[: -len(suffix)]
-            break
-    
-    models_url = f"{base_url}/v1/models"
-    
-    try:
-        headers = {}
-        if api_key and api_key.strip():
-            headers["Authorization"] = f"Bearer {api_key.strip()}"
-        resp = requests.get(models_url, headers=headers, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-    except requests.exceptions.ConnectionError:
-        return [(f"❌ Cannot connect to {base_url}", "")]
-    except requests.exceptions.Timeout:
-        return [("❌ Connection timed out", "")]
-    except Exception as e:
-        return [(f"❌ Error: {str(e)[:80]}", "")]
-    
-    models = data.get("data", data.get("models", []))
-    if not models:
-        return [("⚠️ No models found", "")]
-    
-    models_arr = data.get("models", [])
-    data_arr = data.get("data", [])
-    
-    caps_map = {}
-    for m in models_arr:
-        model_id = m.get("name", m.get("id", ""))
-        caps_map[model_id] = m.get("capabilities", [])
-    
-    if data_arr:
-        models = data_arr
-    else:
-        models = data_arr or models_arr
-    
-    result = []
-    for m in models:
-        model_id = m.get("id", m.get("name", ""))
-        
-        caps = caps_map.get(model_id, m.get("capabilities", []))
-        caps_str = ""
-        if caps:
-            cap_icons = []
-            if "multimodal" in caps or "vision" in caps:
-                cap_icons.append("👁️")
-            if "completion" in caps:
-                cap_icons.append("💬")
-            caps_str = " " + "".join(cap_icons)
-        
-        meta = m.get("meta", {})
-        size_gb = meta.get("size", 0) / (1024**3)
-        size_str = f" ({size_gb:.1f}GB)" if size_gb > 0 else ""
-        
-        display = f"{model_id}{caps_str}{size_str}"
-        result.append((display, model_id))
-    
-    return result if result else [(f"⚠️ No models found", "")]
+# ── Model List ──────────────────────────────────────────────────────
+def fetch_models(api_url: str = "", api_key: str = "") -> list[tuple[str, str]]:
+    """Return available Claude vision models."""
+    return [
+        ("claude-haiku-4-5 👁️ (fastest, cheapest)", "claude-haiku-4-5-20251001"),
+        ("claude-sonnet-4-6 👁️ (balanced)", "claude-sonnet-4-6"),
+        ("claude-opus-4-6 👁️ (most capable)", "claude-opus-4-6"),
+    ]
 
 
 # ── Gradio Theme (Gradio 6.0: pass to launch(), not Blocks) ──────
@@ -684,7 +618,7 @@ def build_ui():
         <div style="text-align: center; margin-bottom: 1rem;">
             <h1 class="title-gradient" style="font-size: 2.5rem; margin: 0;">🎬 Video → Prompt</h1>
             <p style="color: #888; font-size: 1rem; margin: 0;">
-                Extract AI prompts from video using Vision Language Model via llama.cpp API
+                Extract AI prompts from video using Claude Vision API (Anthropic)
             </p>
         </div>
         """)
@@ -700,38 +634,32 @@ def build_ui():
                 )
 
                 # ── API Settings ──
-                gr.Markdown("### ⚙️ API Settings")
+                gr.Markdown("### ⚙️ Claude API Settings")
+                api_key = gr.Textbox(
+                    label="Anthropic API Key",
+                    value=os.environ.get("ANTHROPIC_API_KEY", ""),
+                    placeholder="sk-ant-api...",
+                    type="password",
+                    info="ใส่ API Key จาก console.anthropic.com",
+                )
+                api_url = gr.Textbox(visible=False, value="")  # kept for compat
+
                 with gr.Row():
-                    api_url = gr.Textbox(
-                        label="API Endpoint",
-                        value=DEFAULT_API_URL,
-                        placeholder="http://192.168.3.177:8080/v1/chat/completions",
+                    model_name = gr.Dropdown(
+                        label="Model",
+                        choices=[d for d, _ in fetch_models()],
+                        value="claude-haiku-4-5 👁️ (fastest, cheapest)",
+                        allow_custom_value=True,
+                        interactive=True,
                         scale=4,
                     )
                     refresh_btn = gr.Button(
-                        "🔄 Check Models",
+                        "🔄 Refresh",
                         variant="secondary",
                         scale=1,
                         size="sm",
                     )
-                
-                model_name = gr.Dropdown(
-                    label="Model Name",
-                    choices=[],
-                    value=DEFAULT_MODEL,
-                    allow_custom_value=True,
-                    interactive=True,
-                    info="Click 🔄 Check Models to fetch available models, or type manually",
-                )
                 model_status = gr.Markdown("")
-
-                with gr.Accordion("🔑 Authentication (optional)", open=False):
-                    api_key = gr.Textbox(
-                        label="API Key",
-                        value="",
-                        placeholder="Bearer token for authenticated endpoints (leave empty if none)",
-                        type="password",
-                    )
 
                 # ── Mode ──
                 gr.Markdown("### 🎯 Prompt Mode")
@@ -890,37 +818,12 @@ def build_ui():
                 return None, f"❌ Failed to create ZIP: {e}"
 
         def on_refresh_models(api_url_val, api_key_val):
-            """Refresh model list from API."""
-            if not api_url_val or not api_url_val.strip():
-                return gr.update(choices=[], value=""), "⚠️ Enter API URL first"
-            
-            models = fetch_models(api_url_val, api_key_val or "")
+            """Refresh Claude model list."""
+            models = fetch_models()
             choices = [display for display, _ in models]
-            values = [model_id for _, model_id in models]
-            
-            if not choices:
-                return gr.update(choices=[], value=""), "⚠️ No models found"
-            
-            first = choices[0]
-            if first.startswith("❌") or first.startswith("⚠️"):
-                return gr.update(choices=choices, value=""), first
-            
-            multimodal_count = sum(1 for c in choices if "👁️" in c)
-            status = f"✅ **{len(choices)}** models found"
-            if multimodal_count > 0:
-                status += f" — **{multimodal_count}** with vision 👁️"
-            else:
-                status += " (no vision models detected ⚠️)"
-            
-            default_val = values[0]
-            for c, v in zip(choices, values):
-                if "👁️" in c:
-                    default_val = v
-                    break
-            
             return (
-                gr.update(choices=choices, value=default_val),
-                status,
+                gr.update(choices=choices, value=choices[0] if choices else ""),
+                f"✅ {len(choices)} Claude models available",
             )
 
         # ── History management ──
@@ -1100,8 +1003,8 @@ def build_ui():
         # ── Footer ──
         gr.HTML(f"""
         <div style="text-align: center; margin-top: 2rem; padding: 1rem; color: #666; font-size: 0.8rem;">
-            Video-to-Prompt v{VERSION} | Powered by llama.cpp Vision API | 
-            <a href="https://github.com/nanofatdog/video-to-prompt" target="_blank">GitHub</a>
+            Video-to-Prompt v{VERSION} | Powered by Claude Vision API (Anthropic) |
+            <a href="https://github.com/darkfuryx11/video" target="_blank">GitHub</a>
         </div>
         """)
 
