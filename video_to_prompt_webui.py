@@ -58,6 +58,22 @@ import gradio as gr
 import numpy as np
 from PIL import Image
 
+# ── Config persistence ──────────────────────────────────────────────
+CONFIG_FILE = Path(__file__).parent / "config.json"
+
+def load_config() -> dict:
+    try:
+        return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+def save_config(data: dict) -> None:
+    existing = load_config()
+    existing.update(data)
+    CONFIG_FILE.write_text(json.dumps(existing, indent=2, ensure_ascii=False), encoding="utf-8")
+
+_cfg = load_config()
+
 # ── Constants ───────────────────────────────────────────────────────
 VERSION = "2.0.0"
 DEFAULT_MODEL = "claude-haiku-4-5-20251001"
@@ -654,13 +670,17 @@ def build_ui():
 
                 # ── API Settings ──
                 gr.Markdown("### ⚙️ Claude API Settings")
-                api_key = gr.Textbox(
-                    label="Anthropic API Key",
-                    value=os.environ.get("ANTHROPIC_API_KEY", ""),
-                    placeholder="sk-ant-api...",
-                    type="password",
-                    info="ใส่ API Key จาก console.anthropic.com",
-                )
+                with gr.Row():
+                    api_key = gr.Textbox(
+                        label="Anthropic API Key",
+                        value=_cfg.get("api_key") or os.environ.get("ANTHROPIC_API_KEY", ""),
+                        placeholder="sk-ant-api...",
+                        type="password",
+                        info="ใส่ API Key จาก console.anthropic.com",
+                        scale=4,
+                    )
+                    save_key_btn = gr.Button("💾 Save Key", variant="secondary", scale=1, size="sm")
+                save_key_status = gr.Markdown("")
                 api_url = gr.Textbox(visible=False, value="")  # kept for compat
 
                 with gr.Row():
@@ -815,6 +835,14 @@ def build_ui():
         temp_creative.click(fn=set_temp_creative, outputs=[temperature])
         temp_balanced.click(fn=set_temp_balanced, outputs=[temperature])
         temp_precise.click(fn=set_temp_precise, outputs=[temperature])
+
+        def on_save_key(key_val):
+            if not key_val or not key_val.strip():
+                return "❌ กรุณาใส่ API Key ก่อน"
+            save_config({"api_key": key_val.strip()})
+            return "✅ บันทึก API Key แล้ว (เปิดเว็บใหม่ key ยังคงอยู่)"
+
+        save_key_btn.click(fn=on_save_key, inputs=[api_key], outputs=[save_key_status])
 
         def on_save(text, filename):
             if not text or not text.strip():
