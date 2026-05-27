@@ -777,6 +777,13 @@ def build_ui():
                 provider_badge = gr.Markdown(
                     f"✅ Detected: **{_init_provider}**" if _init_provider else "⚠️ ใส่ API Key เพื่อ detect provider"
                 )
+                # Manual override — visible only when key is ambiguous (sk-* could be OpenAI or Qwen)
+                provider_override = gr.Radio(
+                    choices=["OpenAI", "Qwen"],
+                    value="OpenAI",
+                    label="🔁 sk-* key นี้เป็นของ? (OpenAI หรือ Qwen)",
+                    visible=(_init_provider == "OpenAI"),
+                )
                 provider_state = gr.State(_init_provider)
                 save_key_status = gr.Markdown("")
                 api_url = gr.Textbox(visible=False, value="")  # kept for compat
@@ -933,13 +940,29 @@ def build_ui():
             if p:
                 models = get_provider_models(p)
                 badge = f"✅ Detected: **{p}**"
-                return p, badge, gr.update(choices=models, value=models[0] if models else "")
-            return "", "⚠️ ไม่รู้จัก format — รองรับ: Claude (sk-ant-), OpenAI (sk-), Gemini (AIza)", gr.update(choices=[], value="")
+                show_override = (p == "OpenAI")  # sk-* is ambiguous
+                return (
+                    p, badge,
+                    gr.update(choices=models, value=models[0] if models else ""),
+                    gr.update(visible=show_override, value="OpenAI"),
+                )
+            return "", "⚠️ ไม่รู้จัก format — Claude (sk-ant-) · OpenAI/Qwen (sk-) · Gemini (AIza)", gr.update(choices=[], value=""), gr.update(visible=False)
 
         api_key.change(
             fn=on_key_change,
             inputs=[api_key],
-            outputs=[provider_state, provider_badge, model_name],
+            outputs=[provider_state, provider_badge, model_name, provider_override],
+        )
+
+        def on_override_change(override_val):
+            """User manually selects OpenAI vs Qwen."""
+            models = get_provider_models(override_val)
+            return override_val, gr.update(choices=models, value=models[0] if models else "")
+
+        provider_override.change(
+            fn=on_override_change,
+            inputs=[provider_override],
+            outputs=[provider_state, model_name],
         )
 
         def on_save_key(key_val):
