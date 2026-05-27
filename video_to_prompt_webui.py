@@ -243,8 +243,9 @@ def get_video_info(path: str) -> dict:
             "codec": video_stream.get("codec_name", "unknown"),
             "size_mb": os.path.getsize(path) / (1024 * 1024),
         }
-    except Exception:
-        return {}
+    except Exception as e:
+        print(f"[DBG-vid] get_video_info failed for {path!r}: {e}")
+        return {"_error": str(e)}
 
 
 def extract_frames(video_path: str, frame_count: int = 16, max_size: int = 1280) -> tuple[list[Image.Image], list[float]]:
@@ -452,7 +453,14 @@ def process_video(
         yield None, "❌ Please upload a video file", "", "", "", None
         return
 
-    video_path = video_file.name if hasattr(video_file, 'name') else str(video_file)
+    # Gradio 6 may return dict {"path": "...", "orig_name": "..."} or a plain string
+    if isinstance(video_file, dict):
+        video_path = video_file.get("path") or video_file.get("name", "")
+    elif hasattr(video_file, 'name'):
+        video_path = video_file.name
+    else:
+        video_path = str(video_file)
+    video_path = os.path.normpath(video_path)
     start_time = time.time()
     frames_temp_dir = None
 
@@ -462,9 +470,11 @@ def process_video(
 
     # ── Step 1: Video Info ──
     progress(0.05, desc="🔍 Reading video metadata...")
+    print(f"[DBG-vid] video_path resolved: {video_path!r}")
     info = get_video_info(video_path)
-    if not info:
-        yield None, "❌ Cannot read video file. Check format.", "", "", "", None
+    if not info or "_error" in info:
+        err = info.get("_error", "unknown") if info else "ffprobe returned empty"
+        yield None, f"❌ Cannot read video file.\n\n`{err}`", "", "", "", None
         return
 
     info_text = (
