@@ -865,6 +865,7 @@ def build_ui():
         # ── State ──
         history_state = gr.State([])  # list of dicts: {ts, mode, text}
         frames_dir_state = gr.State(None)  # path to temp frames directory
+        translate_cache = gr.State({"en": None, "th": None})  # cached translations
         
         gr.HTML("""
         <div style="text-align: center; margin-bottom: 1rem;">
@@ -1024,9 +1025,9 @@ def build_ui():
                 # ── Translate Buttons ──
                 gr.Markdown("**🌐 แปลภาษา (offline):**")
                 with gr.Row():
-                    translate_en_btn = gr.Button("🇬🇧 English", scale=1, variant="secondary", size="sm")
-                    translate_th_btn = gr.Button("🇹🇭 ภาษาไทย", scale=1, variant="secondary", size="sm")
-                    download_models_btn = gr.Button("📥 ดาวน์โหลดโมเดล", scale=2, variant="secondary", size="sm")
+                    translate_en_btn = gr.Button("EN English", scale=1, variant="secondary", size="sm")
+                    translate_th_btn = gr.Button("TH ภาษาไทย", scale=1, variant="secondary", size="sm")
+                    download_models_btn = gr.Button("📥 ดาวน์โหลดโมเดลแปลภาษา", scale=2, variant="secondary", size="sm")
                 translate_status = gr.Markdown(get_local_model_status())
 
                 with gr.Row():
@@ -1284,6 +1285,10 @@ def build_ui():
             fn=update_history_after,
             inputs=[history_state, mode, custom_prompt, output_text],
             outputs=[history_state, history_dropdown],
+        ).then(
+            fn=lambda: {"en": None, "th": None},
+            inputs=[],
+            outputs=[translate_cache],
         )
 
         # Download frames
@@ -1312,19 +1317,37 @@ def build_ui():
             outputs=[output_text],
         )
 
-        # ── Translate buttons ──
-        def make_translate_fn(lang: str):
-            def _fn(text):
-                result, status = translate_text(text, lang)
-                return result, status
-            return _fn
+        # ── Translate buttons (with cache: no re-translate on toggle) ──
+        def on_translate(text, cache, lang):
+            """Toggle between cached translations; translate only if not cached."""
+            # If target is already cached, restore it instantly
+            if cache.get(lang):
+                # Also update the "other" slot with current text
+                other = "th" if lang == "en" else "en"
+                new_cache = {**cache, other: text}
+                return cache[lang], new_cache, f"✅ สลับเป็น {'ไทย' if lang == 'th' else 'English'} (cache)"
 
-        for lang, btn in [("en", translate_en_btn), ("th", translate_th_btn)]:
-            btn.click(
-                fn=make_translate_fn(lang),
-                inputs=[output_text],
-                outputs=[output_text, translate_status],
-            )
+            # Not cached yet — translate and store result
+            result, status = translate_text(text, lang)
+            if result == text or result.startswith("❌"):
+                # Failed — don't update cache
+                return text, cache, status
+
+            # Store both: result in target slot, current text in source slot
+            other = "th" if lang == "en" else "en"
+            new_cache = {**cache, lang: result, other: text}
+            return result, new_cache, status
+
+        translate_en_btn.click(
+            fn=lambda txt, c: on_translate(txt, c, "en"),
+            inputs=[output_text, translate_cache],
+            outputs=[output_text, translate_cache, translate_status],
+        )
+        translate_th_btn.click(
+            fn=lambda txt, c: on_translate(txt, c, "th"),
+            inputs=[output_text, translate_cache],
+            outputs=[output_text, translate_cache, translate_status],
+        )
 
         # Download local models
         download_models_btn.click(
