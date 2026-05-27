@@ -103,6 +103,15 @@ PROVIDER_MODELS = {
         ("qwen-vl-max 👁️ (best)", "qwen-vl-max"),
         ("qwen-vl-plus 👁️ (fast)", "qwen-vl-plus"),
     ],
+    "OpenRouter": [
+        ("qwen/qwen2.5-vl-72b-instruct 👁️ (best Qwen)", "qwen/qwen2.5-vl-72b-instruct"),
+        ("qwen/qwen2.5-vl-7b-instruct 👁️ (fast Qwen)", "qwen/qwen2.5-vl-7b-instruct"),
+        ("google/gemini-2.0-flash-001 👁️", "google/gemini-2.0-flash-001"),
+        ("openai/gpt-4o 👁️", "openai/gpt-4o"),
+        ("openai/gpt-4o-mini 👁️", "openai/gpt-4o-mini"),
+        ("anthropic/claude-haiku-4-5 👁️", "anthropic/claude-haiku-4-5"),
+        ("meta-llama/llama-4-scout 👁️ (free)", "meta-llama/llama-4-scout"),
+    ],
 }
 
 def detect_provider(key: str) -> str:
@@ -112,6 +121,8 @@ def detect_provider(key: str) -> str:
         return ""
     if key.startswith("sk-ant"):
         return "Claude"
+    if key.startswith("sk-or-"):
+        return "OpenRouter"
     if key.startswith("AIza") or key.startswith("ya29."):
         return "Gemini"
     if key.startswith("sk-"):
@@ -686,13 +697,16 @@ def call_provider_api(
                 "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", model_id
             )
 
+        if provider == "OpenRouter":
+            return _call_openai_compat("https://openrouter.ai/api/v1", model_id)
+
         # provider == "OpenAI": try OpenAI first, auto-fallback to Qwen on 401
         try:
             return _call_openai_compat(None, model_id)
         except _OAIAuthErr:
             # Key not valid for OpenAI — retry as Qwen (DashScope) with matching model
             qwen_model = "qwen-vl-max"  # default Qwen vision model
-            print(f"[DBG] OpenAI 401 → auto-retry as Qwen ({qwen_model})")
+            print(f"[DBG] OpenAI 401 -> auto-retry as Qwen ({qwen_model})")
             return _call_openai_compat(
                 "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", qwen_model
             )
