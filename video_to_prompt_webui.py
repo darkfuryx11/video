@@ -676,7 +676,7 @@ def call_provider_api(
         )
         return resp.content[0].text, resp.usage.input_tokens, resp.usage.output_tokens
 
-    elif provider in ("OpenAI", "Qwen"):
+    elif provider in ("OpenAI", "Qwen", "OpenRouter"):
         from openai import OpenAI as _OpenAI, AuthenticationError as _OAIAuthErr
         content = []
         for frame in frames:
