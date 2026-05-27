@@ -738,34 +738,94 @@ def call_provider_api(
         raise ValueError(f"Unknown provider: {provider}")
 
 
-# ── Translation ─────────────────────────────────────────────────────
-TRANSLATE_PROMPTS = {
-    "en": "Translate the following text to English. Output ONLY the translated text, no explanation.",
-    "th": "แปลข้อความต่อไปนี้เป็นภาษาไทย ตอบเฉพาะข้อความที่แปลแล้วเท่านั้น ไม่ต้องมีคำอธิบาย",
-    "my": "အောက်ပါစာကို မြန်မာဘာသာဖြင့် ဘာသာပြန်ပါ။ ဘာသာပြန်ထားသောစာသာ ထုတ်ပေးပါ၊ ရှင်းလင်းချက်မလို။",
-}
+# ── Local Offline Translation (argostranslate) ───────────────────────
+# Packages: en↔th only
+_LOCAL_LANG_PAIRS = [("en", "th"), ("th", "en")]
 
-def translate_text(text: str, lang: str, provider: str, api_key: str, model_display: str) -> str:
-    """Translate text to target language using current provider."""
-    if not text or not text.strip():
-        return "❌ No text to translate"
-    if not api_key or not api_key.strip():
-        return "❌ กรุณาใส่ API Key ก่อน"
-    if not provider:
-        return "❌ ไม่รู้จัก provider"
-
-    sys_prompt = TRANSLATE_PROMPTS.get(lang, TRANSLATE_PROMPTS["en"])
-    full_prompt = f"{sys_prompt}\n\n---\n{text.strip()}"
-    model_id = resolve_model_id(provider, model_display)
-
-    # Use a single text "image" list — pass empty frames, text-only call
-    # We need a text-only API call; reuse call_provider_api with no frames
+def _get_argos_pkg(from_code: str, to_code: str):
+    """Return available argostranslate package for the pair, or None."""
     try:
-        result, _, _ = call_provider_api([], full_prompt, provider, api_key, model_id,
-                                         max_tokens=2048, temperature=0.3)
-        return result.strip()
+        from argostranslate import package as _ap
+        for pkg in _ap.get_available_packages():
+            if pkg.from_code == from_code and pkg.to_code == to_code:
+                return pkg
+    except Exception:
+        pass
+    return None
+
+def _is_local_installed(from_code: str, to_code: str) -> bool:
+    """Check if argostranslate package is already installed locally."""
+    try:
+        from argostranslate import package as _ap
+        for pkg in _ap.get_installed_packages():
+            if pkg.from_code == from_code and pkg.to_code == to_code:
+                return True
+    except Exception:
+        pass
+    return False
+
+def get_local_model_status() -> str:
+    """Return status string for UI display."""
+    lines = []
+    for fc, tc in _LOCAL_LANG_PAIRS:
+        icon = "✅" if _is_local_installed(fc, tc) else "⬇️"
+        lines.append(f"{icon} {fc}→{tc}")
+    return "  |  ".join(lines)
+
+def download_local_models() -> str:
+    """Download and install en↔th argostranslate packages. Returns status message."""
+    try:
+        from argostranslate import package as _ap
+        _ap.update_package_index()
+        available = _ap.get_available_packages()
+        installed = 0
+        skipped = 0
+        for fc, tc in _LOCAL_LANG_PAIRS:
+            if _is_local_installed(fc, tc):
+                skipped += 1
+                continue
+            pkg = next((p for p in available if p.from_code == fc and p.to_code == tc), None)
+            if pkg:
+                _ap.install_from_path(pkg.download())
+                installed += 1
+        return f"✅ ดาวน์โหลดเสร็จ: {installed} แพ็กเกจ | ข้ามที่มีแล้ว: {skipped} แพ็กเกจ\n(en↔th พร้อมใช้ offline แล้ว)"
     except Exception as e:
-        return f"❌ Translation error: {e}"
+        return f"❌ Download failed: {e}"
+
+def translate_local(text: str, from_code: str, to_code: str) -> str | None:
+    """Translate using local argostranslate model. Returns None if not available."""
+    if not _is_local_installed(from_code, to_code):
+        return None
+    try:
+        from argostranslate import translate as _at
+        return _at.translate(text, from_code, to_code)
+    except Exception:
+        return None
+
+# ── Translation (local offline only, en↔th) ──────────────────────────
+def translate_text(text: str, lang: str) -> tuple[str, str]:
+    """
+    Translate text using local argostranslate model (en↔th).
+    Returns (translated_text, status_msg).
+    """
+    if not text or not text.strip():
+        return text, "❌ No text to translate"
+
+    # en→th
+    if lang == "th":
+        if not _is_local_installed("en", "th"):
+            return text, "❌ โมเดลยังไม่ได้ดาวน์โหลด — กดปุ่ม 'ดาวน์โหลดโมเดล' ก่อน"
+        result = translate_local(text.strip(), "en", "th")
+        return (result.strip(), "✅ แปลเป็นไทย (offline)") if result else (text, "❌ แปลไม่สำเร็จ")
+
+    # th→en (or any→en)
+    if lang == "en":
+        if not _is_local_installed("th", "en"):
+            return text, "❌ โมเดลยังไม่ได้ดาวน์โหลด — กดปุ่ม 'ดาวน์โหลดโมเดล' ก่อน"
+        result = translate_local(text.strip(), "th", "en")
+        return (result.strip(), "✅ Translated to English (offline)") if result else (text, "❌ Translation failed")
+
+    return text, f"❌ ไม่รองรับภาษา: {lang}"
 
 
 # ── Model List (legacy compat) ───────────────────────────────────────
@@ -962,12 +1022,12 @@ def build_ui():
                 )
 
                 # ── Translate Buttons ──
-                gr.Markdown("**🌐 แปลภาษา:**")
+                gr.Markdown("**🌐 แปลภาษา (offline):**")
                 with gr.Row():
                     translate_en_btn = gr.Button("🇬🇧 English", scale=1, variant="secondary", size="sm")
                     translate_th_btn = gr.Button("🇹🇭 ภาษาไทย", scale=1, variant="secondary", size="sm")
-                    translate_my_btn = gr.Button("🇲🇲 မြန်မာ", scale=1, variant="secondary", size="sm")
-                translate_status = gr.Markdown("")
+                    download_models_btn = gr.Button("📥 ดาวน์โหลดโมเดล", scale=2, variant="secondary", size="sm")
+                translate_status = gr.Markdown(get_local_model_status())
 
                 with gr.Row():
                     output_filename = gr.Textbox(
@@ -1254,22 +1314,24 @@ def build_ui():
 
         # ── Translate buttons ──
         def make_translate_fn(lang: str):
-            def _fn(text, prov, key, mdl):
-                if not text or not text.strip():
-                    return text, "❌ No text to translate"
-                result = translate_text(text, lang, prov, key, mdl)
-                if result.startswith("❌"):
-                    return text, result
-                lang_names = {"en": "English 🇬🇧", "th": "Thai 🇹🇭", "my": "Myanmar 🇲🇲"}
-                return result, f"✅ Translated to {lang_names.get(lang, lang)}"
+            def _fn(text):
+                result, status = translate_text(text, lang)
+                return result, status
             return _fn
 
-        for lang, btn in [("en", translate_en_btn), ("th", translate_th_btn), ("my", translate_my_btn)]:
+        for lang, btn in [("en", translate_en_btn), ("th", translate_th_btn)]:
             btn.click(
                 fn=make_translate_fn(lang),
-                inputs=[output_text, provider_state, api_key, model_name],
+                inputs=[output_text],
                 outputs=[output_text, translate_status],
             )
+
+        # Download local models
+        download_models_btn.click(
+            fn=download_local_models,
+            inputs=[],
+            outputs=[translate_status],
+        )
 
         # ── Footer ──
         gr.HTML(f"""
