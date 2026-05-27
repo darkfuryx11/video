@@ -670,6 +670,8 @@ def call_provider_api(
             b64 = frame_to_base64(frame)
             content.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}})
         content.append({"type": "text", "text": prompt})
+        if not frames:
+            content = prompt  # text-only: pass string directly
         resp = client.messages.create(
             model=model_id, max_tokens=max_tokens, temperature=temperature,
             system=system_msg, messages=[{"role": "user", "content": content}],
@@ -678,11 +680,14 @@ def call_provider_api(
 
     elif provider in ("OpenAI", "Qwen", "OpenRouter"):
         from openai import OpenAI as _OpenAI, AuthenticationError as _OAIAuthErr
-        content = []
-        for frame in frames:
-            b64 = frame_to_base64(frame)
-            content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
-        content.append({"type": "text", "text": prompt})
+        if frames:
+            content = []
+            for frame in frames:
+                b64 = frame_to_base64(frame)
+                content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
+            content.append({"type": "text", "text": prompt})
+        else:
+            content = prompt  # text-only
 
         def _call_openai_compat(base_url, model):
             c = _OpenAI(api_key=key, base_url=base_url)
@@ -721,6 +726,8 @@ def call_provider_api(
             frame.convert("RGB").save(buf, format="JPEG", quality=80)
             parts.append({"mime_type": "image/jpeg", "data": buf.getvalue()})
         parts.append(prompt)
+        if not parts or parts == [prompt]:
+            parts = [prompt]  # text-only
         resp = model.generate_content(
             parts,
             generation_config={"max_output_tokens": max_tokens, "temperature": temperature},
@@ -729,6 +736,36 @@ def call_provider_api(
 
     else:
         raise ValueError(f"Unknown provider: {provider}")
+
+
+# ── Translation ─────────────────────────────────────────────────────
+TRANSLATE_PROMPTS = {
+    "en": "Translate the following text to English. Output ONLY the translated text, no explanation.",
+    "th": "แปลข้อความต่อไปนี้เป็นภาษาไทย ตอบเฉพาะข้อความที่แปลแล้วเท่านั้น ไม่ต้องมีคำอธิบาย",
+    "my": "အောက်ပါစာကို မြန်မာဘာသာဖြင့် ဘာသာပြန်ပါ။ ဘာသာပြန်ထားသောစာသာ ထုတ်ပေးပါ၊ ရှင်းလင်းချက်မလို။",
+}
+
+def translate_text(text: str, lang: str, provider: str, api_key: str, model_display: str) -> str:
+    """Translate text to target language using current provider."""
+    if not text or not text.strip():
+        return "❌ No text to translate"
+    if not api_key or not api_key.strip():
+        return "❌ กรุณาใส่ API Key ก่อน"
+    if not provider:
+        return "❌ ไม่รู้จัก provider"
+
+    sys_prompt = TRANSLATE_PROMPTS.get(lang, TRANSLATE_PROMPTS["en"])
+    full_prompt = f"{sys_prompt}\n\n---\n{text.strip()}"
+    model_id = resolve_model_id(provider, model_display)
+
+    # Use a single text "image" list — pass empty frames, text-only call
+    # We need a text-only API call; reuse call_provider_api with no frames
+    try:
+        result, _, _ = call_provider_api([], full_prompt, provider, api_key, model_id,
+                                         max_tokens=2048, temperature=0.3)
+        return result.strip()
+    except Exception as e:
+        return f"❌ Translation error: {e}"
 
 
 # ── Model List (legacy compat) ───────────────────────────────────────
@@ -923,6 +960,14 @@ def build_ui():
                     elem_classes=["output-text"],
                     placeholder="Your generated prompt will appear here...",
                 )
+
+                # ── Translate Buttons ──
+                gr.Markdown("**🌐 แปลภาษา:**")
+                with gr.Row():
+                    translate_en_btn = gr.Button("🇬🇧 English", scale=1, variant="secondary", size="sm")
+                    translate_th_btn = gr.Button("🇹🇭 ภาษาไทย", scale=1, variant="secondary", size="sm")
+                    translate_my_btn = gr.Button("🇲🇲 မြန်မာ", scale=1, variant="secondary", size="sm")
+                translate_status = gr.Markdown("")
 
                 with gr.Row():
                     output_filename = gr.Textbox(
@@ -1206,6 +1251,25 @@ def build_ui():
             inputs=[output_text],
             outputs=[output_text],
         )
+
+        # ── Translate buttons ──
+        def make_translate_fn(lang: str):
+            def _fn(text, prov, key, mdl):
+                if not text or not text.strip():
+                    return text, "❌ No text to translate"
+                result = translate_text(text, lang, prov, key, mdl)
+                if result.startswith("❌"):
+                    return text, result
+                lang_names = {"en": "English 🇬🇧", "th": "Thai 🇹🇭", "my": "Myanmar 🇲🇲"}
+                return result, f"✅ Translated to {lang_names.get(lang, lang)}"
+            return _fn
+
+        for lang, btn in [("en", translate_en_btn), ("th", translate_th_btn), ("my", translate_my_btn)]:
+            btn.click(
+                fn=make_translate_fn(lang),
+                inputs=[output_text, provider_state, api_key, model_name],
+                outputs=[output_text, translate_status],
+            )
 
         # ── Footer ──
         gr.HTML(f"""
