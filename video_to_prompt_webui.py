@@ -23,6 +23,25 @@ import io
 import json
 import os
 import shutil
+
+# ── Ensure FFmpeg is in PATH (handles winget install that requires shell restart) ──
+def _find_ffmpeg_bin() -> str | None:
+    """Search common Windows locations for FFmpeg bin directory."""
+    import glob
+    patterns = [
+        r"C:\Users\*\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg*\ffmpeg-*\bin",
+        r"C:\Program Files\ffmpeg*\bin",
+        r"C:\ffmpeg\bin",
+    ]
+    for pattern in patterns:
+        matches = glob.glob(pattern)
+        if matches:
+            return matches[0]
+    return None
+
+_ff_bin = _find_ffmpeg_bin()
+if _ff_bin and _ff_bin not in os.environ.get("PATH", ""):
+    os.environ["PATH"] = _ff_bin + os.pathsep + os.environ.get("PATH", "")
 import subprocess
 import sys
 import tempfile
