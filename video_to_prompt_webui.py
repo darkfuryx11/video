@@ -666,20 +666,36 @@ def call_provider_api(
         return resp.content[0].text, resp.usage.input_tokens, resp.usage.output_tokens
 
     elif provider in ("OpenAI", "Qwen"):
-        from openai import OpenAI as _OpenAI
-        base_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1" if provider == "Qwen" else None
-        client = _OpenAI(api_key=key, base_url=base_url)
+        from openai import OpenAI as _OpenAI, AuthenticationError as _OAIAuthErr
         content = []
         for frame in frames:
             b64 = frame_to_base64(frame)
             content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
         content.append({"type": "text", "text": prompt})
-        resp = client.chat.completions.create(
-            model=model_id, max_tokens=max_tokens, temperature=temperature,
-            messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": content}],
-        )
-        u = resp.usage
-        return resp.choices[0].message.content, u.prompt_tokens, u.completion_tokens
+
+        def _call_openai_compat(base_url, model):
+            c = _OpenAI(api_key=key, base_url=base_url)
+            r = c.chat.completions.create(
+                model=model, max_tokens=max_tokens, temperature=temperature,
+                messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": content}],
+            )
+            return r.choices[0].message.content, r.usage.prompt_tokens, r.usage.completion_tokens
+
+        if provider == "Qwen":
+            return _call_openai_compat(
+                "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", model_id
+            )
+
+        # provider == "OpenAI": try OpenAI first, auto-fallback to Qwen on 401
+        try:
+            return _call_openai_compat(None, model_id)
+        except _OAIAuthErr:
+            # Key not valid for OpenAI — retry as Qwen (DashScope) with matching model
+            qwen_model = "qwen-vl-max"  # default Qwen vision model
+            print(f"[DBG] OpenAI 401 → auto-retry as Qwen ({qwen_model})")
+            return _call_openai_compat(
+                "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", qwen_model
+            )
 
     elif provider == "Gemini":
         import google.generativeai as genai
