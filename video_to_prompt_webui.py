@@ -1025,12 +1025,12 @@ def build_ui():
                 return None, f"❌ Failed to create ZIP: {e}"
 
         def on_refresh_models(api_url_val, api_key_val):
-            """Refresh Claude model list."""
-            models = fetch_models()
-            choices = [display for display, _ in models]
+            """Refresh model list based on detected provider."""
+            p = detect_provider(api_key_val)
+            choices = get_provider_models(p) if p else get_provider_models("Claude")
             return (
                 gr.update(choices=choices, value=choices[0] if choices else ""),
-                f"✅ {len(choices)} Claude models available",
+                f"✅ {len(choices)} models ({p or 'Claude'})",
             )
 
         # ── History management ──
